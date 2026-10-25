@@ -1,0 +1,10 @@
+output/
+build/
+test/
+tests/
+*.obj
+*.o
+*.exe
+*.log
+sync-run*.log
+.plan-*.json
