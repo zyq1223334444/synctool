@@ -13,7 +13,8 @@ rem ---- 1) MSVC already in PATH ----
 where cl >nul 2>nul
 if !errorlevel! equ 0 (
     echo [MSVC] Building with cl...
-    cl /nologo /std:c++17 /EHsc /utf-8 /O2 /W3 /MT %INC% src\main.cpp %CSRC% /Fe:output\SyncTool.exe /Fo:build\
+    rc /nologo /fo build\app.res res\app.rc
+    cl /nologo /std:c++17 /EHsc /utf-8 /O2 /W3 /MT %INC% src\main.cpp %CSRC% build\app.res /Fe:output\SyncTool.exe /Fo:build\ /link /MANIFEST:NO
     if !errorlevel! equ 0 set "BUILT=1"
 )
 
@@ -28,7 +29,7 @@ if not "!BUILT!"=="1" (
             set "VCVARS=!VSROOT!\VC\Auxiliary\Build\vcvarsall.bat"
             if exist "!VCVARS!" (
                 echo [MSVC] Building inside Visual Studio environment...
-                cmd /c ""!VCVARS!" x64 >nul 2>nul && cl /nologo /std:c++17 /EHsc /utf-8 /O2 /W3 /MT %INC% src\main.cpp %CSRC% /Fe:output\SyncTool.exe /Fo:build\"
+                cmd /c ""!VCVARS!" x64 >nul 2>nul && rc /nologo /fo build\app.res res\app.rc && cl /nologo /std:c++17 /EHsc /utf-8 /O2 /W3 /MT %INC% src\main.cpp %CSRC% build\app.res /Fe:output\SyncTool.exe /Fo:build\ /link /MANIFEST:NO"
                 if !errorlevel! equ 0 set "BUILT=1"
             )
         )
@@ -40,12 +41,18 @@ if not "!BUILT!"=="1" (
     where g++ >nul 2>nul
     if !errorlevel! equ 0 (
         echo [MinGW] Building with g++...
+        set "RES="
+        where windres >nul 2>nul
+        if !errorlevel! equ 0 (
+            windres res\app.rc -O coff -o build\app.res
+            if !errorlevel! equ 0 set "RES=build\app.res"
+        )
         gcc -O2 -c %INC% third_party\miniz\miniz.c -o build\miniz.o
         gcc -O2 -c %INC% third_party\miniz\miniz_zip.c -o build\miniz_zip.o
         gcc -O2 -c %INC% third_party\miniz\miniz_tdef.c -o build\miniz_tdef.o
         gcc -O2 -c %INC% third_party\miniz\miniz_tinfl.c -o build\miniz_tinfl.o
         if !errorlevel! equ 0 (
-            g++ -std=c++17 -O2 -Wall -Wextra -pthread %INC% src\main.cpp build\miniz.o build\miniz_zip.o build\miniz_tdef.o build\miniz_tinfl.o -o output\SyncTool.exe -static -static-libgcc -static-libstdc++
+            g++ -std=c++17 -O2 -Wall -Wextra -pthread %INC% src\main.cpp build\miniz.o build\miniz_zip.o build\miniz_tdef.o build\miniz_tinfl.o !RES! -o output\SyncTool.exe -static -static-libgcc -static-libstdc++ -ladvapi32 -lshell32
             if !errorlevel! equ 0 set "BUILT=1"
         )
     )

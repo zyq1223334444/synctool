@@ -1,5 +1,5 @@
 // ============================================================================
-// SyncTool v2.0.0 —— 多文件夹同步 / 还原工具（Windows / Linux / macOS，C++17）
+// SyncTool v2.1.0 —— 多文件夹同步 / 还原工具（Windows / Linux / macOS，C++17）
 //
 // 用法：
 //   SyncTool sync <文件夹1> <文件夹2> [...] [--min-level N] [--dry-run]
@@ -18,6 +18,9 @@
 //   6) 多线程并行复制/备份（--jobs），zip 改为流式写盘，内存占用大幅降低；
 //   7) 跨平台：文件锁、时间戳、控制台、隐藏属性均做平台分支；
 //   8) 同一最小单元时间完全相同则跳过，不做无意义复制。
+//   9) v2.1：时间相同先比对内容哈希；不同则逐个询问源/跳过，询问期间其他线程继续复制；
+//       Ctrl+C 可保留备份（下次继续）或回滚本次更改；新增 clean 清理备份；
+//       Windows 长路径未开启时询问并自动开启（必要时提权 + 重启自身）。
 // ============================================================================
 #define _CRT_SECURE_NO_WARNINGS
 #if defined(_WIN32)
@@ -41,11 +44,13 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -57,8 +62,13 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#  include <shellapi.h>
+#endif
 
 #include "miniz.h"
 
@@ -66,9 +76,10 @@ namespace fs = std::filesystem;
 using std::string;
 using std::vector;
 
-static const char* kVersion = "2.0.0";
+static const char* kVersion = "2.1.0";
 static const char* kBackupName = ".backup";
 static const char* kLegacyBackupName = "backup";
+static const char* kJournalName = "journal.jsonl";
 
 // ---------------------------------------------------------------- 全局状态 ---
 static std::atomic<bool> g_cancel{false};
@@ -77,8 +88,16 @@ static std::atomic<uint64_t> g_scanFiles{0};
 static std::atomic<uint64_t> g_doneOps{0};
 static std::atomic<uint64_t> g_doneBytes{0};
 static std::atomic<uint64_t> g_doneFiles{0};
-static uint64_t g_totalOps = 0;
-static uint64_t g_totalBytes = 0;
+static std::atomic<uint64_t> g_totalOps{0};
+static std::atomic<uint64_t> g_totalBytes{0};
+static std::atomic<uint64_t> g_hashDone{0};
+static std::atomic<uint64_t> g_hashTotal{0};
+static std::atomic<bool> g_promptActive{false};
+static std::mutex g_promptMutex;
+static bool g_yes = false;
+static std::atomic<bool> g_needLongPaths{false};
+static std::atomic<uint32_t> g_maxPathLen{0};
+static std::vector<string> g_originalArgs;
 static std::mutex g_logMutex;
 static std::mutex g_curMutex;
 static std::mutex g_errMutex;
@@ -86,7 +105,16 @@ static std::mutex g_manifestMutex;
 static std::string g_current;
 static vector<string> g_errors;
 static bool g_tty = false;
-static std::atomic<int> g_phase{0}; // 0=扫描 1=预检 2=执行
+static std::atomic<int> g_phase{0}; // 0=扫描 1=预检 2=哈希 3=执行 4=完成
+
+static void logLine(const string& s);
+static bool askYesNo(const string& question, bool defaultYes);
+static void clearHashCaches();
+
+#if defined(_WIN32)
+#  pragma comment(lib, "advapi32.lib")
+#  pragma comment(lib, "shell32.lib")
+#endif
 
 // ---------------------------------------------------------------- 平台工具 ---
 static void setupConsole()
@@ -121,6 +149,157 @@ static void installSignalHandlers()
     sigaction(SIGTERM, &sa, nullptr);
 #endif
 }
+
+static bool g_noLongPaths = false;
+static bool g_skipLongPathCheck = false;
+static bool g_noHashCache = false;
+
+#if defined(_WIN32)
+static std::wstring utf8ToWide(const string& s)
+{
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+static std::wstring getExePathW()
+{
+    std::vector<wchar_t> buf(32768);
+    DWORD n = GetModuleFileNameW(nullptr, buf.data(), (DWORD)buf.size());
+    return std::wstring(buf.data(), n);
+}
+
+static bool isElevated()
+{
+    HANDLE h = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &h)) return false;
+    TOKEN_ELEVATION te{};
+    DWORD sz = sizeof(te);
+    BOOL ok = GetTokenInformation(h, TokenElevation, &te, sizeof(te), &sz);
+    CloseHandle(h);
+    return ok && te.TokenIsElevated;
+}
+
+static bool longPathsEnabled()
+{
+    DWORD v = 0, sz = sizeof(v);
+    LONG r = RegGetValueW(HKEY_LOCAL_MACHINE,
+                          L"SYSTEM\\CurrentControlSet\\Control\\FileSystem",
+                          L"LongPathsEnabled", RRF_RT_REG_DWORD, nullptr, &v, &sz);
+    return r == ERROR_SUCCESS && v != 0;
+}
+
+static bool setLongPathsEnabled()
+{
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\FileSystem",
+                      0, KEY_SET_VALUE | KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
+        return false;
+    DWORD v = 1;
+    LONG r = RegSetValueExW(k, L"LongPathsEnabled", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS;
+}
+
+static std::wstring quoteWinArg(const std::wstring& a)
+{
+    bool need = a.empty() || a.find_first_of(L" \t\"") != std::wstring::npos;
+    if (!need) return a;
+    std::wstring out = L"\"";
+    for (wchar_t c : a)
+    {
+        if (c == L'"') out += L"\\\"";
+        else out += c;
+    }
+    out += L"\"";
+    return out;
+}
+
+static int runElevatedEnableLongPaths()
+{
+    std::wstring exe = getExePathW();
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe.c_str();
+    sei.lpParameters = L"--enable-long-paths";
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) return 1;
+    WaitForSingleObject(sei.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(sei.hProcess, &code);
+    CloseHandle(sei.hProcess);
+    return (int)code;
+}
+
+static int relaunchSelfWithLongPaths()
+{
+    std::wstring cmd = L"\"" + getExePathW() + L"\"";
+    for (size_t i = 1; i < g_originalArgs.size(); ++i)
+    {
+        if (g_originalArgs[i] == "--long-paths-enabled") continue;
+        cmd += L" ";
+        cmd += quoteWinArg(utf8ToWide(g_originalArgs[i]));
+    }
+    cmd += L" --long-paths-enabled";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(0);
+    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+    {
+        logLine("[长路径] 重新启动失败，请手动重新运行。");
+        return 1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int)code;
+}
+
+// 返回 true 表示继续；false 表示已经重启（exitCode 为子进程退出码）
+static bool ensureLongPaths(int& exitCode)
+{
+    if (g_skipLongPathCheck || g_noLongPaths) return true;
+    if (longPathsEnabled()) return true;
+
+    bool yes = askYesNo("检测到 Windows 长路径支持（LongPathsEnabled）未开启，是否自动开启？", true);
+    if (!yes)
+    {
+        logLine("[长路径] 未开启；路径超过 260 字符时可能失败。");
+        return true;
+    }
+
+    bool ok = false;
+    if (isElevated()) ok = setLongPathsEnabled();
+    else
+    {
+        int rc = runElevatedEnableLongPaths();
+        ok = (rc == 0) && longPathsEnabled();
+    }
+    if (!ok)
+    {
+        logLine("[长路径] 自动开启失败（可能取消了 UAC 或没有管理员权限）。");
+        return true;
+    }
+    logLine("[长路径] 已开启 LongPathsEnabled=1，正在重新启动程序以生效……");
+    exitCode = relaunchSelfWithLongPaths();
+    return false;
+}
+#else
+static bool ensureLongPaths(int& exitCode)
+{
+    (void)exitCode;
+    return true;
+}
+#endif
 
 static std::tm localNowTm()
 {
@@ -163,7 +342,11 @@ static string makeTimestamp()
 
 static string trim(const string& s)
 {
-    size_t b = s.find_first_not_of(" \t\r\n");
+    size_t off = 0;
+    // 去掉 PowerShell 管道/文件可能带上的 UTF-8 BOM
+    if (s.size() >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
+        off = 3;
+    size_t b = s.find_first_not_of(" \t\r\n", off);
     if (b == string::npos) return "";
     size_t e = s.find_last_not_of(" \t\r\n");
     return s.substr(b, e - b + 1);
@@ -190,6 +373,37 @@ static string relStr(const fs::path& root, const fs::path& p)
         out += part.u8string();
     }
     return out;
+}
+
+static uint32_t pathLength(const fs::path& p)
+{
+#if defined(_WIN32)
+    return (uint32_t)p.wstring().size();
+#else
+    return (uint32_t)p.u8string().size();
+#endif
+}
+
+static void notePathLength(const fs::path& p)
+{
+    uint32_t n = pathLength(p);
+    uint32_t old = g_maxPathLen.load();
+    while (n > old && !g_maxPathLen.compare_exchange_weak(old, n)) {}
+#if defined(_WIN32)
+    if (n >= 250) g_needLongPaths.store(true);
+#else
+    if (n >= 3500) g_needLongPaths.store(true);
+#endif
+}
+
+static void noteLongPathError(const std::error_code& ec)
+{
+#if defined(_WIN32)
+    if (ec.value() == ERROR_FILENAME_EXCED_RANGE || ec.value() == ERROR_PATH_NOT_FOUND)
+        g_needLongPaths.store(true);
+#else
+    if (ec.value() == ENAMETOOLONG) g_needLongPaths.store(true);
+#endif
 }
 
 static int countComps(const string& s)
@@ -303,6 +517,245 @@ static uint64_t fnv1a64(const string& s)
     return h;
 }
 
+// ---------------------------------------------------------------- 内容哈希 ---
+// 128 位非加密哈希（两个不同乘子的 FNV 变体），用于“时间相同但内容可能不同”的比对。
+struct H128
+{
+    uint64_t a = 1469598103934665603ULL;
+    uint64_t b = 1099511628211ULL;
+};
+
+static inline uint64_t rotl64(uint64_t x, int r)
+{
+    return (x << r) | (x >> (64 - r));
+}
+
+static inline void h128MixWord(H128& h, uint64_t x)
+{
+    h.a ^= x;
+    h.a *= 1099511628211ULL;
+    h.a = rotl64(h.a, 13);
+    h.b += x;
+    h.b *= 14029467366897019727ULL;
+    h.b = rotl64(h.b, 31);
+}
+
+static inline void h128MixByte(H128& h, unsigned char c)
+{
+    h.a = (h.a ^ c) * 1099511628211ULL;
+    h.b = (h.b ^ c) * 14029467366897019727ULL;
+}
+
+static void h128MixData(H128& h, const void* data, size_t n)
+{
+    const unsigned char* p = (const unsigned char*)data;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8)
+    {
+        uint64_t x;
+        std::memcpy(&x, p + i, 8);
+        h128MixWord(h, x);
+    }
+    for (; i < n; ++i) h128MixByte(h, p[i]);
+}
+
+static string h128Finish(H128 h, uint64_t total)
+{
+    h.a ^= total;
+    h.a *= 1099511628211ULL;
+    h.b ^= total;
+    h.b *= 14029467366897019727ULL;
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "%016llx%016llx",
+                  (unsigned long long)h.a, (unsigned long long)h.b);
+    return string(buf);
+}
+
+static string hexEncode(const string& s)
+{
+    static const char* d = "0123456789abcdef";
+    string out;
+    out.reserve(s.size() * 2);
+    for (unsigned char c : s)
+    {
+        out += d[c >> 4];
+        out += d[c & 15];
+    }
+    return out;
+}
+
+static string hexDecode(const string& s)
+{
+    auto val = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    string out;
+    out.reserve(s.size() / 2);
+    for (size_t i = 0; i + 1 < s.size(); i += 2)
+    {
+        int hi = val(s[i]), lo = val(s[i + 1]);
+        if (hi < 0 || lo < 0) return string();
+        out += (char)((hi << 4) | lo);
+    }
+    return out;
+}
+
+struct HashCacheEntry
+{
+    uint64_t size = 0;
+    int64_t mtime = 0;
+    string hash;
+};
+
+class HashCache
+{
+public:
+    ~HashCache() { save(); }
+
+    void open(const fs::path& p)
+    {
+        enabled_ = true;
+        path_ = p;
+        std::ifstream f(path_, std::ios::binary);
+        if (!f) return;
+        string line;
+        while (std::getline(f, line))
+        {
+            size_t t1 = line.find('\t');
+            if (t1 == string::npos) continue;
+            size_t t2 = line.find('\t', t1 + 1);
+            if (t2 == string::npos) continue;
+            size_t t3 = line.find('\t', t2 + 1);
+            if (t3 == string::npos) continue;
+            string path = hexDecode(line.substr(0, t1));
+            if (path.empty()) continue;
+            HashCacheEntry e;
+            e.size = (uint64_t)std::strtoull(line.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 10);
+            e.mtime = (int64_t)std::strtoll(line.substr(t2 + 1, t3 - t2 - 1).c_str(), nullptr, 10);
+            e.hash = line.substr(t3 + 1);
+            if (!e.hash.empty()) map_[path] = e;
+        }
+    }
+
+    bool get(const fs::path& p, uint64_t size, int64_t mtime, string& out) const
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        if (!enabled_) return false;
+        auto it = map_.find(p.u8string());
+        if (it == map_.end()) return false;
+        if (it->second.size != size || it->second.mtime != mtime) return false;
+        out = it->second.hash;
+        return true;
+    }
+
+    void put(const fs::path& p, uint64_t size, int64_t mtime, const string& hash)
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        if (!enabled_) return;
+        HashCacheEntry e;
+        e.size = size;
+        e.mtime = mtime;
+        e.hash = hash;
+        map_[p.u8string()] = e;
+        dirty_ = true;
+    }
+
+    void erase(const fs::path& p)
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        if (!enabled_) return;
+        auto it = map_.find(p.u8string());
+        if (it != map_.end()) { map_.erase(it); dirty_ = true; }
+    }
+
+    void eraseTree(const fs::path& p)
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        if (!enabled_) return;
+        string prefix = p.u8string();
+        if (!prefix.empty() && prefix.back() != '/' && prefix.back() != '\\')
+            prefix += fs::path::preferred_separator;
+        for (auto it = map_.begin(); it != map_.end();)
+        {
+            if (it->first == p.u8string() || it->first.compare(0, prefix.size(), prefix) == 0)
+            {
+                it = map_.erase(it);
+                dirty_ = true;
+            }
+            else ++it;
+        }
+    }
+
+    void save()
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        if (!enabled_ || !dirty_ || path_.empty()) return;
+        std::error_code ec;
+        fs::create_directories(path_.parent_path(), ec);
+        fs::path tmp = path_;
+        tmp += ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            if (!f) return;
+            for (const auto& kv : map_)
+            {
+                f << hexEncode(kv.first) << '\t' << kv.second.size << '\t'
+                  << kv.second.mtime << '\t' << kv.second.hash << '\n';
+            }
+        }
+        fs::rename(tmp, path_, ec);
+        if (ec)
+        {
+            // Windows 上目标已存在时 rename 可能失败；先删旧文件再试一次
+            std::error_code rec;
+            fs::remove(path_, rec);
+            fs::rename(tmp, path_, ec);
+        }
+        if (ec) { std::error_code e2; fs::remove(tmp, e2); }
+        dirty_ = false;
+    }
+
+private:
+    fs::path path_;
+    std::unordered_map<string, HashCacheEntry> map_;
+    mutable std::mutex m_;
+    bool dirty_ = false;
+    bool enabled_ = false;
+};
+
+static int64_t mtimeKey(const fs::file_time_type& t)
+{
+    return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+}
+
+static bool hashFileContents(const fs::path& p, uint64_t size, int64_t mtime,
+                             HashCache* cache, string& out)
+{
+    if (cache && cache->get(p, size, mtime, out)) return true;
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return false;
+    H128 h;
+    vector<char> buf(1 << 20);
+    uint64_t total = 0;
+    while (f)
+    {
+        f.read(buf.data(), (std::streamsize)buf.size());
+        std::streamsize n = f.gcount();
+        if (n > 0)
+        {
+            h128MixData(h, buf.data(), (size_t)n);
+            total += (uint64_t)n;
+        }
+    }
+    if (f.bad()) return false;
+    out = h128Finish(h, total);
+    if (cache) cache->put(p, size, mtime, out);
+    return true;
+}
+
 // ---------------------------------------------------------------- 日志/进度 ---
 static size_t g_progressLen = 0;
 
@@ -328,6 +781,32 @@ static void addError(const string& s)
     g_errors.push_back(s);
     if (g_errors.size() <= 200) logLine("[错误] " + s);
     else if (g_errors.size() == 201) logLine("[错误] 错误过多，后续仅计数……");
+}
+
+// 交互输入：暂停进度刷新，避免提示被进度行覆盖
+static string askLine(const string& prompt)
+{
+    std::lock_guard<std::mutex> lk(g_promptMutex);
+    g_promptActive.store(true);
+    {
+        std::lock_guard<std::mutex> lg(g_logMutex);
+        clearProgressLine();
+        std::cout << prompt;
+        std::cout.flush();
+    }
+    string line;
+    if (!std::getline(std::cin, line)) line.clear();
+    if (!g_tty) std::cout << "\n";
+    g_promptActive.store(false);
+    return trim(line);
+}
+
+static bool askYesNo(const string& question, bool defaultYes)
+{
+    if (g_yes) return true; // --yes：确认类询问一律继续
+    string a = askLine(question + (defaultYes ? " [Y/n] " : " [y/N] "));
+    if (a.empty()) return defaultYes;
+    return a[0] == 'y' || a[0] == 'Y';
 }
 
 // 写入过程中的兜底：剩余空间低于 256MB 立即停止，避免把系统盘写满
@@ -380,6 +859,7 @@ private:
         while (!stop_.load())
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            if (g_promptActive.load()) continue;
             auto now = std::chrono::steady_clock::now();
             if (!g_tty && std::chrono::duration_cast<std::chrono::seconds>(now - last).count() < 5)
                 continue;
@@ -391,6 +871,7 @@ private:
     void render(bool final)
     {
         std::lock_guard<std::mutex> lk(g_logMutex);
+        if (g_promptActive.load() && !final) return;
         int ph = g_phase.load();
         string cur = getCurrent();
         if (cur.size() > 70) cur = "..." + cur.substr(cur.size() - 67);
@@ -406,9 +887,15 @@ private:
             os << "[预检] 正在生成操作计划";
             if (!cur.empty()) os << " · " << cur;
         }
+        else if (ph == 2)
+        {
+            uint64_t done = g_hashDone.load(), total = g_hashTotal.load();
+            os << "[哈希] 已比对 " << formatNum(done) << "/" << formatNum(total) << " 个版本";
+            if (!cur.empty()) os << " · " << cur;
+        }
         else
         {
-            uint64_t done = g_doneOps.load(), total = g_totalOps;
+            uint64_t done = g_doneOps.load(), total = g_totalOps.load();
             double pct = total ? (double)done * 100.0 / (double)total : 0.0;
             static auto t0 = std::chrono::steady_clock::now();
             static uint64_t lastBytes = 0;
@@ -423,10 +910,10 @@ private:
                 lastBytes = b;
                 lastT = now;
             }
-            double eta = speed > 1 ? (double)(g_totalBytes - g_doneBytes.load()) / speed : -1;
+            double eta = speed > 1 ? (double)(g_totalBytes.load() - g_doneBytes.load()) / speed : -1;
             os << "[执行 " << std::fixed << std::setprecision(1) << pct << "%] "
                << formatNum(done) << "/" << formatNum(total) << " 项 · "
-               << formatBytes(g_doneBytes.load()) << "/" << formatBytes(g_totalBytes)
+               << formatBytes(g_doneBytes.load()) << "/" << formatBytes(g_totalBytes.load())
                << " · " << formatBytes((uint64_t)speed) << "/s · 剩余 " << formatDuration(eta);
             if (!cur.empty()) os << " · " << cur;
         }
@@ -895,6 +1382,44 @@ struct Version
     uint64_t files = 0;
 };
 
+// 单元内容哈希：文件直接哈希；目录把“路径+大小+文件哈希”排序后汇总
+static bool hashUnit(const Version& v, HashCache* cache, string& out)
+{
+    if (!v.isDir) return hashFileContents(v.abs, v.size, mtimeKey(v.t), cache, out);
+
+    vector<string> lines;
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(v.abs, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+    {
+        std::error_code ec2;
+        if (it->is_symlink(ec2)) continue;
+        string rel = relStr(v.abs, it->path());
+        if (it->is_directory(ec2))
+        {
+            lines.push_back("D:" + rel);
+        }
+        else if (it->is_regular_file(ec2))
+        {
+            uintmax_t sz = it->file_size(ec2);
+            string fh;
+            if (!hashFileContents(it->path(), ec2 ? 0 : (uint64_t)sz, mtimeKey(it->last_write_time(ec2)), cache, fh))
+                return false;
+            lines.push_back("F:" + rel + ":" + std::to_string((uint64_t)sz) + ":" + fh);
+        }
+    }
+    if (ec) return false;
+    std::sort(lines.begin(), lines.end());
+    H128 h;
+    for (const auto& s : lines)
+    {
+        h128MixData(h, s.data(), s.size());
+        h128MixByte(h, '\n');
+    }
+    out = h128Finish(h, (uint64_t)lines.size());
+    return true;
+}
+
 struct Unit
 {
     vector<Version> versions;
@@ -925,6 +1450,7 @@ static void scanFolder(int idx, const fs::path& root, int minLevel, const Exclud
             if (fs::is_symlink(st)) continue; // 不跟随符号链接/目录联接，避免循环
 
             string rel = relStr(root, e.path());
+            notePathLength(e.path());
             if (excludes.match(rel, fs::is_directory(st))) continue;
 
             if (fs::is_directory(st))
@@ -968,7 +1494,7 @@ static void scanFolder(int idx, const fs::path& root, int minLevel, const Exclud
                 if ((g_scanFiles.load() & 0x3FF) == 0) setCurrent(e.path().u8string());
             }
         }
-        if (ec) errors.push_back("遍历目录失败: " + dir.u8string() + " : " + ec.message());
+        if (ec) { noteLongPathError(ec); errors.push_back("遍历目录失败: " + dir.u8string() + " : " + ec.message()); }
     };
     walk(root, 0);
 }
@@ -997,10 +1523,31 @@ struct Op
     uint64_t backupBytes = 0;
 };
 
+struct EqualCandidate
+{
+    string key;
+    vector<const Version*> versions;
+};
+
+struct ConflictVersion
+{
+    int folder = -1;
+    const Version* v = nullptr;
+    string hash;
+};
+
+struct Conflict
+{
+    string key;
+    vector<ConflictVersion> versions;
+};
+
 struct Plan
 {
     UnitMap units;
     vector<Op> ops;
+    vector<EqualCandidate> equalCandidates;
+    vector<Conflict> conflicts;
     vector<uint64_t> required; // 每个目标文件夹预计新增占用
     vector<uint64_t> copyPer;
     vector<uint64_t> backupPer;
@@ -1008,6 +1555,7 @@ struct Plan
     uint64_t backupTotal = 0;
     uint64_t unitCount = 0;
     uint64_t skipped = 0;
+    uint64_t conflictCopies = 0;
 };
 
 static void buildPlan(Plan& plan, size_t folderCount)
@@ -1029,6 +1577,8 @@ static void buildPlan(Plan& plan, size_t folderCount)
             else if (v.t == win->t && v.isDir && !win->isDir) win = &v;
         }
 
+        bool anyOp = false;
+        uint64_t equalTargets = 0;
         for (size_t f = 0; f < folderCount; ++f)
         {
             if (win->folder == (int)f) continue;
@@ -1039,7 +1589,8 @@ static void buildPlan(Plan& plan, size_t folderCount)
             if (!v) need = true;
             else if (v->isDir != win->isDir) need = true;
             else if (v->t < win->t) need = true;
-            if (!need) { if (v) ++plan.skipped; continue; }
+            if (!need) { if (v) ++equalTargets; continue; }
+            anyOp = true;
 
             Op op;
             op.key = kv.first;
@@ -1058,6 +1609,99 @@ static void buildPlan(Plan& plan, size_t folderCount)
             plan.required[f] += op.copyBytes + op.backupBytes;
             plan.ops.push_back(op);
         }
+
+        if (!anyOp && u.versions.size() >= 2)
+        {
+            EqualCandidate c;
+            c.key = kv.first;
+            for (auto& v : u.versions) c.versions.push_back(&v);
+            plan.equalCandidates.push_back(c);
+        }
+        else
+        {
+            plan.skipped += equalTargets;
+        }
+    }
+}
+
+static fs::path hashCachePath(const vector<fs::path>& folders)
+{
+    std::error_code ec;
+    fs::path tmp = fs::temp_directory_path(ec);
+    if (ec) return fs::path();
+    string key;
+    for (auto& f : folders) key += f.u8string() + "|";
+    char hx[32];
+    std::snprintf(hx, sizeof(hx), "%016llx", (unsigned long long)fnv1a64(key));
+    return tmp / "SyncTool" / (string("hashcache-v2-") + hx + ".tsv");
+}
+
+static void hashEqualCandidates(Plan& plan, const vector<fs::path>& folders, int jobs, HashCache& cache)
+{
+    if (plan.equalCandidates.empty()) return;
+
+    g_phase.store(2);
+    uint64_t total = 0;
+    for (auto& c : plan.equalCandidates) total += c.versions.size();
+    g_hashTotal.store(total);
+    g_hashDone.store(0);
+    setCurrent("比对同时间单元内容");
+
+    vector<std::pair<size_t, size_t>> tasks;
+    for (size_t ci = 0; ci < plan.equalCandidates.size(); ++ci)
+        for (size_t vi = 0; vi < plan.equalCandidates[ci].versions.size(); ++vi)
+            tasks.emplace_back(ci, vi);
+    vector<vector<string>> hashes(plan.equalCandidates.size());
+    for (size_t i = 0; i < hashes.size(); ++i) hashes[i].assign(plan.equalCandidates[i].versions.size(), string());
+
+    std::atomic<size_t> next{0};
+    auto worker = [&]() {
+        while (!g_cancel.load())
+        {
+            size_t i = next.fetch_add(1);
+            if (i >= tasks.size()) break;
+            size_t ci = tasks[i].first, vi = tasks[i].second;
+            const Version& v = *plan.equalCandidates[ci].versions[vi];
+            string h;
+            if (hashUnit(v, &cache, h)) hashes[ci][vi] = h;
+            else addError("计算内容哈希失败: " + v.abs.u8string());
+            g_hashDone.fetch_add(1);
+            setCurrent(v.abs.u8string());
+        }
+    };
+    vector<std::thread> pool;
+    int n = std::max(1, std::min<int>(jobs, (int)tasks.size()));
+    for (int i = 0; i < n; ++i) pool.emplace_back(worker);
+    for (auto& t : pool) t.join();
+    cache.save();
+    if (g_cancel.load()) return;
+
+    for (size_t ci = 0; ci < plan.equalCandidates.size(); ++ci)
+    {
+        auto& cand = plan.equalCandidates[ci];
+        std::set<string> distinct;
+        bool bad = false;
+        for (auto& h : hashes[ci])
+        {
+            if (h.empty()) { bad = true; break; }
+            distinct.insert(h);
+        }
+        if (bad || distinct.size() <= 1)
+        {
+            plan.skipped += cand.versions.size();
+            continue;
+        }
+        Conflict c;
+        c.key = cand.key;
+        for (size_t vi = 0; vi < cand.versions.size(); ++vi)
+        {
+            ConflictVersion cv;
+            cv.folder = cand.versions[vi]->folder;
+            cv.v = cand.versions[vi];
+            cv.hash = hashes[ci][vi];
+            c.versions.push_back(cv);
+        }
+        plan.conflicts.push_back(c);
     }
 }
 
@@ -1096,17 +1740,51 @@ static string buildPlanJson(const Plan& plan, const vector<fs::path>& folders, i
 }
 
 // ---------------------------------------------------------------- 执行 ---------
+struct JournalEntry
+{
+    uint64_t seq = 0;
+    string key;
+    int target = -1;
+    string action;   // add / replace
+    bool oldIsDir = false;
+    bool winIsDir = false;
+    string backupRel; // 相对 backupRoot 的备份路径；add 为空
+    string state;     // started / backedUp / done / failed
+};
+
 struct ApplyContext
 {
     const vector<fs::path>* roots = nullptr;
+    string runTs;
     vector<fs::path> backupRoots;
     vector<vector<string>> manifests;
     std::mutex backupDirMutex;
     vector<bool> backupDirReady;
+    std::mutex rootMutex;
+    vector<std::ofstream> journals;
+    vector<vector<JournalEntry>> journalEntries;
+    std::mutex journalMutex;
+    std::atomic<uint64_t> seq{0};
+    HashCache* hashCache = nullptr;
 };
+
+static bool ensureRunBackupRoot(ApplyContext& ctx, int f, string& err)
+{
+    (void)err;
+    std::lock_guard<std::mutex> lk(ctx.rootMutex);
+    if (!ctx.backupRoots[f].empty()) return true;
+    std::error_code ec;
+    fs::path base = (*ctx.roots)[f] / kBackupName;
+    fs::path p = base / fs::u8path(ctx.runTs);
+    int k = 2;
+    while (fs::exists(p, ec)) p = base / fs::u8path(ctx.runTs + "-" + std::to_string(k++));
+    ctx.backupRoots[f] = p;
+    return true;
+}
 
 static bool ensureBackupDir(ApplyContext& ctx, int f, string& err)
 {
+    if (!ensureRunBackupRoot(ctx, f, err)) return false;
     std::lock_guard<std::mutex> lk(ctx.backupDirMutex);
     if (ctx.backupDirReady[f]) return true;
     std::error_code ec;
@@ -1117,6 +1795,40 @@ static bool ensureBackupDir(ApplyContext& ctx, int f, string& err)
     setHidden(ctx.backupRoots[f]);
     ctx.backupDirReady[f] = true;
     return true;
+}
+
+static void journalAppend(ApplyContext& ctx, const JournalEntry& e)
+{
+    if (e.target < 0) return;
+    string rerr;
+    if (!ensureRunBackupRoot(ctx, e.target, rerr)) return; // 失败则只保留内存记录
+    std::lock_guard<std::mutex> lk(ctx.journalMutex);
+    if (ctx.journals.size() <= (size_t)e.target)
+    {
+        ctx.journals.resize(ctx.backupRoots.size());
+        ctx.journalEntries.resize(ctx.backupRoots.size());
+    }
+    if (!ctx.journals[e.target].is_open())
+    {
+        std::error_code ec;
+        fs::create_directories(ctx.backupRoots[e.target], ec);
+        ctx.journals[e.target].open(ctx.backupRoots[e.target] / kJournalName,
+                                    std::ios::binary | std::ios::app);
+    }
+    std::ostringstream os;
+    os << "{\"seq\":" << e.seq
+       << ",\"key\":\"" << jsonEscape(e.key)
+       << "\",\"target\":" << e.target
+       << ",\"action\":\"" << e.action
+       << "\",\"oldIsDir\":" << (e.oldIsDir ? "true" : "false")
+       << ",\"winIsDir\":" << (e.winIsDir ? "true" : "false")
+       << ",\"backup\":\"" << jsonEscape(e.backupRel)
+       << "\",\"state\":\"" << e.state << "\"}";
+    if (ctx.journals[e.target].is_open())
+    {
+        ctx.journals[e.target] << os.str() << "\n";
+    }
+    ctx.journalEntries[e.target].push_back(e);
 }
 
 static bool backupOld(const Op& op, ApplyContext& ctx, string& err)
@@ -1150,20 +1862,35 @@ static void applyOp(const Op& op, ApplyContext& ctx)
     checkLowSpace((*ctx.roots)[op.target]);
     if (g_cancel.load()) { g_doneOps.fetch_add(1); return; }
 
+    JournalEntry je;
+    je.seq = ctx.seq.fetch_add(1);
+    je.key = op.key;
+    je.target = op.target;
+    je.action = op.replace ? "replace" : "add";
+    je.oldIsDir = op.oldIsDir;
+    je.winIsDir = op.winIsDir;
+    je.backupRel = op.replace ? (op.oldIsDir ? op.key + ".zip" : op.key) : "";
+    je.state = "started";
+    // 只写最终状态，避免每个单元写 2-3 行、在大同步里产生几十万行 journal
     if (op.replace)
     {
         if (!backupOld(op, ctx, err))
         {
             addError("备份失败（跳过该单元）: " + op.key + " : " + err);
+            je.state = "failed";
+            journalAppend(ctx, je);
             g_doneOps.fetch_add(1);
             return;
         }
+
         fs::path oldPath = op.old->abs;
         if (op.oldIsDir) fs::remove_all(oldPath, ec);
         else fs::remove(oldPath, ec);
         if (ec)
         {
             addError("删除旧版本失败: " + oldPath.u8string() + " : " + ec.message());
+            je.state = "backedUp";
+            journalAppend(ctx, je);
             g_doneOps.fetch_add(1);
             return;
         }
@@ -1171,12 +1898,14 @@ static void applyOp(const Op& op, ApplyContext& ctx)
 
     fs::path dst = (*ctx.roots)[op.target] / fs::u8path(op.key);
     fs::create_directories(dst.parent_path(), ec);
+    bool copyOk = true;
     if (op.winIsDir)
     {
         if (fs::exists(dst, ec)) fs::remove_all(dst, ec);
         if (!copyDirTree(op.win->abs, dst))
         {
             addError("复制目录失败: " + op.key);
+            copyOk = false;
         }
         else
         {
@@ -1190,13 +1919,31 @@ static void applyOp(const Op& op, ApplyContext& ctx)
     {
         string cerr;
         if (!copyFileWithTime(op.win->abs, dst, cerr))
+        {
             addError("复制失败: " + op.key + " : " + cerr);
+            copyOk = false;
+        }
         else
         {
             g_doneBytes.fetch_add(op.win->size);
             g_doneFiles.fetch_add(1);
         }
     }
+    if (!copyOk)
+    {
+        // 替换失败时旧版本已备份，标记为 backedUp 以便回滚；新增失败标记 failed
+        je.state = op.replace ? "backedUp" : "failed";
+        journalAppend(ctx, je);
+        g_doneOps.fetch_add(1);
+        return;
+    }
+    if (ctx.hashCache)
+    {
+        if (op.winIsDir) ctx.hashCache->eraseTree(dst);
+        else ctx.hashCache->erase(dst);
+    }
+    je.state = "done";
+    journalAppend(ctx, je);
     g_doneOps.fetch_add(1);
 }
 
@@ -1215,6 +1962,149 @@ static void runWorkers(ApplyContext& ctx, const Plan& plan, int jobs)
     int n = std::max(1, std::min<int>(jobs, (int)plan.ops.size()));
     for (int i = 0; i < n; ++i) pool.emplace_back(worker);
     for (auto& t : pool) t.join();
+}
+
+// 同时间不同内容：在独立的解析线程里逐个询问；工作线程继续复制普通单元
+static void resolveConflicts(const Plan& plan, const vector<fs::path>& folders, ApplyContext& ctx)
+{
+    if (plan.conflicts.empty()) return;
+    if (g_yes)
+    {
+        logLine("[冲突] 检测到 " + std::to_string(plan.conflicts.size()) + " 个同时间不同内容的单元，--yes 模式全部跳过。");
+        return;
+    }
+
+    logLine("\n=== 同时间内容冲突 ===\n将逐个询问使用哪个文件夹的版本作为源；其他线程会继续复制。");
+    for (size_t i = 0; i < plan.conflicts.size(); ++i)
+    {
+        if (g_cancel.load()) break;
+        const Conflict& c = plan.conflicts[i];
+        std::ostringstream os;
+        os << "\n[冲突 " << (i + 1) << "/" << plan.conflicts.size() << "] " << c.key
+           << "  （修改时间相同，内容不同）\n";
+        for (size_t j = 0; j < c.versions.size(); ++j)
+        {
+            const ConflictVersion& cv = c.versions[j];
+            os << "  " << (j + 1) << ") " << folders[cv.folder].u8string()
+               << "  " << formatBytes(cv.v->size)
+               << "  hash " << cv.hash.substr(0, 12) << "\n";
+        }
+        os << "  0) 跳过（保持各自现状）\n";
+
+        g_promptActive.store(true);
+        {
+            std::lock_guard<std::mutex> lk(g_logMutex);
+            clearProgressLine();
+            std::cout << os.str();
+            std::cout.flush();
+        }
+
+        int pick = -1;
+        while (pick < 0)
+        {
+            string ans = askLine("请选择作为源的序号（1-" + std::to_string(c.versions.size()) + "，0=跳过）: ");
+            if (ans.empty()) { pick = 0; break; }
+            bool digits = std::all_of(ans.begin(), ans.end(), [](char ch) { return std::isdigit((unsigned char)ch); });
+            if (!digits) { std::cout << "  输入无效，请重新输入。\n"; continue; }
+            int n = std::atoi(ans.c_str());
+            if (n == 0) { pick = 0; break; }
+            if (n >= 1 && n <= (int)c.versions.size()) { pick = n; break; }
+            std::cout << "  序号超出范围，请重新输入。\n";
+        }
+        if (pick == 0)
+        {
+            logLine("  已跳过: " + c.key);
+            continue;
+        }
+
+        const ConflictVersion& src = c.versions[pick - 1];
+        for (const auto& cv : c.versions)
+        {
+            if (cv.folder == src.folder || cv.hash == src.hash) continue;
+            if (g_cancel.load()) break;
+            Op op;
+            op.key = c.key;
+            op.target = cv.folder;
+            op.replace = true;
+            op.oldIsDir = cv.v->isDir;
+            op.winIsDir = src.v->isDir;
+            op.win = src.v;
+            op.old = cv.v;
+            op.copyBytes = src.v->size;
+            op.backupBytes = cv.v->size;
+            g_totalOps.fetch_add(1);
+            g_totalBytes.fetch_add(op.copyBytes + op.backupBytes);
+            logLine("  使用 " + folders[src.folder].u8string() + " 作为源，更新 " + folders[cv.folder].u8string() + " : " + c.key);
+            applyOp(op, ctx);
+        }
+    }
+}
+
+static int rollbackRun(ApplyContext& ctx, const vector<fs::path>& folders)
+{
+    // 回滚期间忽略取消标志，否则 Ctrl+C 会让解压/复制刚开头就退出
+    bool prevCancel = g_cancel.exchange(false);
+    int restored = 0, removed = 0, errors = 0;
+    for (size_t f = 0; f < folders.size(); ++f)
+    {
+        if (f >= ctx.backupRoots.size() || ctx.backupRoots[f].empty()) continue;
+        auto& entries = ctx.journalEntries[f];
+        std::map<uint64_t, JournalEntry> latest;
+        for (const auto& e : entries) latest[e.seq] = e;
+        for (auto rit = latest.rbegin(); rit != latest.rend(); ++rit)
+        {
+            const JournalEntry& e = rit->second;
+            if (e.state == "started" && e.action == "replace") continue;
+            if (e.state == "failed" && e.action == "replace") continue;
+
+            fs::path target = folders[f] / fs::u8path(e.key);
+            std::error_code ec;
+            if (e.action == "add")
+            {
+                if (fs::exists(target, ec))
+                {
+                    fs::remove_all(target, ec);
+                    if (ec) { logLine("[回滚] 删除失败: " + target.u8string() + " : " + ec.message()); ++errors; }
+                    else ++removed;
+                }
+                if (ctx.hashCache)
+                {
+                    if (e.winIsDir) ctx.hashCache->eraseTree(target);
+                    else ctx.hashCache->erase(target);
+                }
+                continue;
+            }
+
+            // replace: 先删除当前，再从备份恢复旧版本
+            if (fs::exists(target, ec)) fs::remove_all(target, ec);
+            if (ec) { logLine("[回滚] 删除失败: " + target.u8string() + " : " + ec.message()); ++errors; continue; }
+            bool ok = false;
+            if (e.oldIsDir)
+            {
+                string zerr;
+                fs::create_directories(target, ec);
+                ok = unzipFileToDir(ctx.backupRoots[f] / fs::u8path(e.key + ".zip"), target, zerr);
+                if (!ok) logLine("[回滚] 解压失败: " + e.key + " : " + zerr);
+            }
+            else
+            {
+                string cerr;
+                fs::create_directories(target.parent_path(), ec);
+                ok = copyFileWithTime(ctx.backupRoots[f] / fs::u8path(e.key), target, cerr);
+                if (!ok) logLine("[回滚] 恢复失败: " + e.key + " : " + cerr);
+            }
+            if (ok) ++restored;
+            else ++errors;
+            if (ctx.hashCache)
+            {
+                if (e.oldIsDir) ctx.hashCache->eraseTree(target);
+                else ctx.hashCache->erase(target);
+            }
+        }
+    }
+    logLine("[回滚] 恢复 " + std::to_string(restored) + " 项，删除新增 " + std::to_string(removed) + " 项，错误 " + std::to_string(errors) + " 项。");
+    g_cancel.store(prevCancel);
+    return errors;
 }
 
 // ---------------------------------------------------------------- 同步入口 ---
@@ -1242,12 +2132,17 @@ static int runSync(const vector<string>& args)
         else if (a.rfind("--exclude=", 0) == 0) excludes.add(a.substr(10));
         else if (a == "--dry-run") dryRun = true;
         else if (a == "--force") force = true;
+        else if (a == "--yes" || a == "-y") g_yes = true;
+        else if (a == "--long-paths-enabled") g_skipLongPathCheck = true;
+        else if (a == "--no-long-paths") g_noLongPaths = true;
+        else if (a == "--no-hash-cache") g_noHashCache = true;
         else if (a.rfind("--", 0) == 0) { std::cout << "[错误] 未知参数: " << a << "\n"; return 1; }
         else folderArgs.push_back(fs::path(a));
     }
     if (minLevel < -1) { std::cout << "[错误] --min-level 必须 >= 0\n"; return 1; }
     jobs = std::max(1, std::min(jobs, 32));
     if (folderArgs.size() < 2) { std::cout << "[错误] sync 至少需要 2 个文件夹\n"; return 1; }
+    if (g_noHashCache) clearHashCaches();
 
     // 解析并校验文件夹
     vector<fs::path> folders;
@@ -1269,6 +2164,19 @@ static int runSync(const vector<string>& args)
             if (isStrictlyWithin(folders[i], folders[j]) || isStrictlyWithin(folders[j], folders[i]))
             { std::cout << "[错误] 文件夹不能互相包含: " << folders[i].u8string() << " 与 " << folders[j].u8string() << "\n"; return 1; }
         }
+
+    // 长路径支持：未开启时询问并自动开启；开启后重启自身以让 manifest 生效
+    if (!dryRun)
+    {
+        int lpExit = 0;
+        if (!ensureLongPaths(lpExit)) return lpExit;
+    }
+#if defined(_WIN32)
+    else if (!longPathsEnabled())
+    {
+        logLine("[长路径] 当前未开启 LongPathsEnabled；预览阶段不会修改注册表，超长路径可能读取失败。");
+    }
+#endif
 
     // 兼容 v1：把旧的 backup 目录迁移为 .backup 并隐藏（dry-run 只提示）
     for (auto& f : folders)
@@ -1367,8 +2275,10 @@ static int runSync(const vector<string>& args)
 
     // 预检磁盘空间（按卷聚合，C: 上 TEMP 与 Documents\Code 共用同一块盘）
     std::cout << "\n=== 预检 ===\n";
-    std::cout << "单元 " << formatNum(plan.unitCount) << " 个，待执行操作 " << formatNum(plan.ops.size())
-              << " 个（时间相同跳过 " << formatNum(plan.skipped) << " 个）\n";
+    std::cout << "单元 " << formatNum(plan.unitCount) << " 个，待执行操作 " << formatNum(plan.ops.size()) << " 个";
+    if (!plan.equalCandidates.empty())
+        std::cout << "，待比对同时间单元 " << formatNum(plan.equalCandidates.size()) << " 个";
+    std::cout << "\n";
     std::cout << "预计复制 " << formatBytes(plan.copyTotal) << "，备份 " << formatBytes(plan.backupTotal)
               << "（备份为未压缩上限估算）\n";
     bool spaceFail = false;
@@ -1416,14 +2326,37 @@ static int runSync(const vector<string>& args)
         for (auto* l : locks) { l->release(); delete l; }
         return 2;
     }
+
+    // 修改时间相同的单元：比对内容哈希；不同则进入冲突队列
+    HashCache hashCache;
+    fs::path hcp = hashCachePath(folders);
+    if (!hcp.empty() && !g_noHashCache) hashCache.open(hcp);
+    if (!plan.equalCandidates.empty() && !g_cancel.load())
+    {
+        std::cout << "\n=== 同时间内容比对 ===\n";
+        hashEqualCandidates(plan, folders, jobs, hashCache);
+        if (g_cancel.load())
+        {
+            ui.stop();
+            std::cout << "\n[中断] 已取消（未修改任何文件）\n";
+            for (auto* l : locks) { l->release(); delete l; }
+            return 130;
+        }
+        std::cout << "同时间内容一致跳过 " << formatNum(plan.skipped)
+                  << " 个版本，内容冲突 " << formatNum(plan.conflicts.size()) << " 个单元\n";
+    }
+
     if (dryRun)
     {
         ui.stop();
+        if (!plan.conflicts.empty())
+            std::cout << "\n[预览] 有 " << plan.conflicts.size()
+                      << " 个同时间不同内容的单元；实际同步时会逐个询问使用哪个为源。\n";
         std::cout << "\n[预览] 不修改任何文件。\n";
         for (auto* l : locks) { l->release(); delete l; }
         return 0;
     }
-    if (plan.ops.empty())
+    if (plan.ops.empty() && plan.conflicts.empty())
     {
         ui.stop();
         std::cout << "\n[完成] 所有单元已一致，无需同步。\n";
@@ -1431,36 +2364,31 @@ static int runSync(const vector<string>& args)
         return 0;
     }
 
-    // 备份根目录
     ApplyContext ctx;
     ctx.roots = &folders;
+    ctx.runTs = makeTimestamp();
+    ctx.hashCache = &hashCache;
     ctx.backupRoots.resize(folders.size());
     ctx.manifests.resize(folders.size());
     ctx.backupDirReady.assign(folders.size(), false);
-    string ts = makeTimestamp();
-    for (size_t i = 0; i < folders.size(); ++i)
-    {
-        bool needBackup = false;
-        for (auto& op : plan.ops) if (op.target == (int)i && op.replace) { needBackup = true; break; }
-        if (!needBackup) continue;
-        fs::path base = folders[i] / kBackupName;
-        fs::path p = base / fs::u8path(ts);
-        int k = 2;
-        while (fs::exists(p, ec)) p = base / fs::u8path(ts + "-" + std::to_string(k++));
-        ctx.backupRoots[i] = p;
-    }
+    ctx.journals.resize(folders.size());
+    ctx.journalEntries.resize(folders.size());
 
-    g_phase.store(2);
+    g_phase.store(3);
     setCurrent("");
-    g_totalOps = plan.ops.size();
-    g_totalBytes = plan.copyTotal + plan.backupTotal;
+    g_totalOps.store(plan.ops.size());
+    g_totalBytes.store(plan.copyTotal + plan.backupTotal);
     std::cout << "\n=== 执行 ===\n";
-    std::cout << "并行线程 " << jobs << "，总进度 " << formatNum(g_totalOps) << " 项 / "
-              << formatBytes(g_totalBytes) << "\n";
+    std::cout << "并行线程 " << jobs << "，普通操作 " << formatNum(plan.ops.size()) << " 项";
+    if (!plan.conflicts.empty())
+        std::cout << "，同时间冲突待询问 " << formatNum(plan.conflicts.size()) << " 个单元";
+    std::cout << "\n";
 
+    std::thread resolver([&] { resolveConflicts(plan, folders, ctx); });
     runWorkers(ctx, plan, jobs);
+    resolver.join();
 
-    // 写 manifest
+    // 写 manifest（即使中断，也把已完成的目录备份登记下来）
     for (size_t i = 0; i < folders.size(); ++i)
     {
         if (ctx.manifests[i].empty()) continue;
@@ -1471,19 +2399,86 @@ static int runSync(const vector<string>& args)
             addError("写 manifest 失败: " + merr);
     }
 
+    bool canceled = g_cancel.load();
     ui.stop();
-    g_phase.store(3);
-    std::cout << "\n=== 同步" << (g_cancel.load() ? "已中断" : "完成") << " ===\n";
-    std::cout << "操作 " << formatNum(g_doneOps.load()) << "/" << formatNum(g_totalOps)
+    g_phase.store(4);
+    std::cout << "\n=== 同步" << (canceled ? "已中断" : "完成") << " ===\n";
+    std::cout << "操作 " << formatNum(g_doneOps.load()) << "/" << formatNum(g_totalOps.load())
               << "，处理文件 " << formatNum(g_doneFiles.load())
               << "，数据 " << formatBytes(g_doneBytes.load()) << "\n";
     if (!g_errors.empty()) std::cout << "错误 " << g_errors.size() << " 条（见上方日志）\n";
+
+    if (canceled)
+    {
+        std::cout << "\n[中断] 已完成 " << formatNum(g_doneOps.load()) << "/" << formatNum(g_totalOps.load()) << " 项。\n";
+        bool keep = askYesNo("保留本次备份结果以便下次继续？", true);
+        if (!keep)
+        {
+            bool doRollback = askYesNo("是否还原本次已完成的更改？", true);
+            if (doRollback)
+            {
+                int rberr = rollbackRun(ctx, folders);
+                if (rberr == 0)
+                {
+                    std::lock_guard<std::mutex> lk(ctx.journalMutex);
+                    for (auto& j : ctx.journals) if (j.is_open()) j.close();
+                    std::error_code rec;
+                    for (auto& b : ctx.backupRoots)
+                        if (!b.empty()) fs::remove_all(b, rec);
+                    std::cout << "[回滚] 本次备份目录已清除。\n";
+                }
+                else
+                {
+                    std::cout << "[回滚] 有 " << rberr << " 项失败，保留本次备份目录以便手动处理。\n";
+                }
+            }
+            else
+            {
+                bool del = askYesNo("保留当前状态，并删除本次备份结果？（旧版本将不可恢复）", false);
+                if (del)
+                {
+                    std::lock_guard<std::mutex> lk(ctx.journalMutex);
+                    for (auto& j : ctx.journals) if (j.is_open()) j.close();
+                    std::error_code rec;
+                    for (auto& b : ctx.backupRoots)
+                        if (!b.empty()) fs::remove_all(b, rec);
+                    std::cout << "[清理] 本次备份目录已删除。\n";
+                }
+            }
+        }
+        else
+        {
+            std::cout << "[保留] 下次运行会自动跳过已完成的单元，继续处理未完成的部分。\n";
+        }
+    }
+    else
+    {
+        // 正常完成：关闭并删除运行日志，仅保留 manifest 和备份内容
+        std::lock_guard<std::mutex> lk(ctx.journalMutex);
+        for (size_t i = 0; i < ctx.journals.size(); ++i)
+        {
+            if (ctx.journals[i].is_open()) ctx.journals[i].close();
+            if (i < ctx.backupRoots.size() && !ctx.backupRoots[i].empty())
+            {
+                std::error_code rec;
+                fs::remove(ctx.backupRoots[i] / kJournalName, rec);
+                // 只有 journal、没有实际备份时，删掉空时间点目录，避免留下空 .backup/<ts>
+                std::error_code rec2;
+                fs::remove(ctx.backupRoots[i], rec2);
+            }
+        }
+    }
+
     for (size_t i = 0; i < folders.size(); ++i)
         if (!ctx.backupRoots[i].empty())
-            std::cout << "备份目录: " << ctx.backupRoots[i].u8string() << "\n";
+        {
+            std::error_code bec;
+            if (fs::exists(ctx.backupRoots[i], bec))
+                std::cout << "备份目录: " << ctx.backupRoots[i].u8string() << "\n";
+        }
 
     for (auto* l : locks) { l->release(); delete l; }
-    return g_cancel.load() ? 130 : (g_errors.empty() ? 0 : 1);
+    return canceled ? 130 : (g_errors.empty() ? 0 : 1);
 }
 
 // ---------------------------------------------------------------- 还原 ---------
@@ -1521,6 +2516,25 @@ static bool isSafeRel(const string& rel)
     return true;
 }
 
+static void clearHashCaches()
+{
+    std::error_code ec;
+    fs::path dir = fs::temp_directory_path(ec) / "SyncTool";
+    if (ec) return;
+    for (auto it = fs::directory_iterator(dir, ec);
+         !ec && it != fs::directory_iterator(); it.increment(ec))
+    {
+        std::error_code ec2;
+        if (!it->is_regular_file(ec2)) continue;
+        string name = it->path().filename().u8string();
+        if (name.rfind("hashcache-", 0) == 0)
+        {
+            std::error_code rec;
+            fs::remove(it->path(), rec);
+        }
+    }
+}
+
 static int runRestore(const vector<string>& args)
 {
     string folderArg, timeArg;
@@ -1551,10 +2565,11 @@ static int runRestore(const vector<string>& args)
     if (ts.empty())
     {
         std::cout << "可还原的时间点（新 -> 旧）：\n";
-        for (size_t i = 0; i < times.size(); ++i) std::cout << "  " << i << ") " << times[i] << "\n";
-        std::cout << "请输入序号或时间戳（直接回车 = 最新）: ";
+        for (size_t i = 0; i < times.size(); ++i) std::cout << "  " << (i + 1) << ") " << times[i] << "\n";
+        std::cout << "请输入序号（1-" << times.size() << "，直接回车 = 最新）: ";
         string line;
         std::getline(std::cin, line);
+        if (!g_tty) std::cout << "\n";
         line = trim(line);
         if (line.empty()) ts = times[0];
         else
@@ -1563,8 +2578,8 @@ static int runRestore(const vector<string>& args)
             if (allDigit)
             {
                 int idx = std::atoi(line.c_str());
-                if (idx < 0 || (size_t)idx >= times.size()) { std::cout << "[错误] 序号超出范围\n"; return 1; }
-                ts = times[idx];
+                if (idx < 1 || (size_t)idx > times.size()) { std::cout << "[错误] 序号超出范围\n"; return 1; }
+                ts = times[idx - 1];
             }
             else ts = line;
         }
@@ -1651,6 +2666,7 @@ static int runRestore(const vector<string>& args)
         for (auto& s : errors) std::cout << "\n  - " << s;
     }
     std::cout << "\n";
+    if (!dryRun) clearHashCaches();
     return errors.empty() ? 0 : 1;
 }
 
@@ -1666,8 +2682,112 @@ static int runList(const vector<string>& args)
     vector<string> times = listTimeDirs(backupDir, ec);
     if (times.empty()) { std::cout << "[提示] 该文件夹还没有备份\n"; return 0; }
     std::cout << folder.u8string() << " 的备份时间点（新 -> 旧，共 " << times.size() << " 个）：\n";
-    for (size_t i = 0; i < times.size(); ++i) std::cout << "  " << i << ") " << times[i] << "\n";
+    for (size_t i = 0; i < times.size(); ++i) std::cout << "  " << (i + 1) << ") " << times[i] << "\n";
     return 0;
+}
+
+// ---------------------------------------------------------------- 清理备份 ---
+static uint64_t dirSize(const fs::path& p)
+{
+    uint64_t total = 0;
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(p, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+    {
+        std::error_code ec2;
+        if (it->is_regular_file(ec2)) total += (uint64_t)it->file_size(ec2);
+        if (ec2) continue;
+    }
+    return total;
+}
+
+static int runClean(const vector<string>& args)
+{
+    string folderArg, timeArg;
+    bool all = false, dryRun = false;
+    for (size_t i = 0; i < args.size(); ++i)
+    {
+        const string& a = args[i];
+        if (a == "--time") { if (i + 1 >= args.size()) { std::cout << "[错误] --time 需要参数\n"; return 1; } timeArg = args[++i]; }
+        else if (a.rfind("--time=", 0) == 0) timeArg = a.substr(7);
+        else if (a == "--all") all = true;
+        else if (a == "--dry-run") dryRun = true;
+        else if (a == "--yes" || a == "-y") g_yes = true;
+        else if (a.rfind("--", 0) == 0) { std::cout << "[错误] 未知参数: " << a << "\n"; return 1; }
+        else if (folderArg.empty()) folderArg = a;
+        else { std::cout << "[错误] clean 只能选择一个文件夹: " << a << "\n"; return 1; }
+    }
+    if (folderArg.empty()) { std::cout << "[错误] 用法: SyncTool clean <文件夹> [--time <时间戳>|--all] [--dry-run]\n"; return 1; }
+
+    std::error_code ec;
+    fs::path folder = fs::weakly_canonical(fs::absolute(fs::path(folderArg), ec), ec);
+    if (ec || !fs::is_directory(folder, ec)) { std::cout << "[错误] 文件夹不存在: " << folderArg << "\n"; return 1; }
+    fs::path backupDir = findBackupRoot(folder);
+    if (backupDir.empty()) { std::cout << "[提示] 没有 .backup/backup 目录\n"; return 0; }
+
+    vector<string> times = listTimeDirs(backupDir, ec);
+    if (times.empty()) { std::cout << "[提示] 备份目录下没有时间点\n"; return 0; }
+
+    vector<uint64_t> sizes(times.size(), 0);
+    for (size_t i = 0; i < times.size(); ++i) sizes[i] = dirSize(backupDir / fs::u8path(times[i]));
+
+    vector<size_t> selected;
+    if (all) { for (size_t i = 0; i < times.size(); ++i) selected.push_back(i); }
+    else if (!trim(timeArg).empty())
+    {
+        string ts = trim(timeArg);
+        for (size_t i = 0; i < times.size(); ++i) if (times[i] == ts) selected.push_back(i);
+        if (selected.empty()) { std::cout << "[错误] 时间点不存在: " << ts << "\n"; return 1; }
+    }
+    else
+    {
+        std::cout << folder.u8string() << " 的备份时间点（新 -> 旧）：\n";
+        for (size_t i = 0; i < times.size(); ++i)
+            std::cout << "  " << (i + 1) << ") " << times[i] << "  " << formatBytes(sizes[i]) << "\n";
+        string line = askLine("请输入要清理的序号（可多选，如 1,3；0=全部；回车=取消）: ");
+        if (line.empty()) { std::cout << "[取消] 未清理任何备份。\n"; return 0; }
+        std::stringstream ss(line);
+        string tok;
+        bool any = false;
+        while (std::getline(ss, tok, ','))
+        {
+            tok = trim(tok);
+            if (tok.empty()) continue;
+            bool digits = std::all_of(tok.begin(), tok.end(), [](char c) { return std::isdigit((unsigned char)c); });
+            if (!digits) { std::cout << "[错误] 无效序号: " << tok << "\n"; return 1; }
+            int n = std::atoi(tok.c_str());
+            if (n == 0) { selected.clear(); for (size_t i = 0; i < times.size(); ++i) selected.push_back(i); any = true; break; }
+            if (n < 1 || (size_t)n > times.size()) { std::cout << "[错误] 序号超出范围: " << n << "\n"; return 1; }
+            selected.push_back((size_t)(n - 1));
+            any = true;
+        }
+        if (!any) { std::cout << "[取消] 未选择任何时间点。\n"; return 0; }
+        std::sort(selected.begin(), selected.end());
+        selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+    }
+
+    uint64_t total = 0;
+    std::cout << (dryRun ? "[预览] 将清理 " : "[清理] 将删除 ") << selected.size() << " 个时间点，共 ";
+    for (size_t i : selected) total += sizes[i];
+    std::cout << formatBytes(total) << "：\n";
+    for (size_t i : selected) std::cout << "  " << times[i] << "  " << formatBytes(sizes[i]) << "\n";
+    if (dryRun) { std::cout << "[预览] 不删除任何文件。\n"; return 0; }
+    if (!askYesNo("确认删除这些备份？（不可恢复）", false))
+    {
+        std::cout << "[取消] 未删除任何备份。\n";
+        return 0;
+    }
+
+    int errors = 0;
+    for (size_t i : selected)
+    {
+        std::error_code rec;
+        fs::remove_all(backupDir / fs::u8path(times[i]), rec);
+        if (rec) { std::cout << "[错误] 删除失败: " << times[i] << " : " << rec.message() << "\n"; ++errors; }
+        else std::cout << "  已删除 " << times[i] << "\n";
+    }
+    std::cout << (errors ? "[完成] 有错误" : "[完成] 清理完成") << "，共 " << (selected.size() - errors) << " 个时间点\n";
+    return errors ? 1 : 0;
 }
 
 static void printUsage()
@@ -1679,16 +2799,24 @@ static void printUsage()
         << "      --min-level N    深度 N+1 的目录作为整体替换单位；不设则逐文件比较\n"
         << "      --jobs N         并行复制线程数（默认按 CPU，1-32）\n"
         << "      --exclude 模式   排除路径（可多次；支持 * ?，如 --exclude '*/.git/*'）\n"
-        << "      --dry-run        只预检并生成计划，不修改文件\n"
-        << "      --force          磁盘空间不足时仍继续（危险）\n\n"
+        << "      --dry-run        只预检并生成计划，不修改文件（会比对同时间单元的内容哈希）\n"
+        << "      --force          磁盘空间不足时仍继续（危险）\n"
+        << "      --yes            所有询问取默认值（冲突跳过、中断保留、长路径开启）\n"
+        << "      --no-long-paths  不自动开启 Windows 长路径支持\n"
+        << "      --no-hash-cache  不使用跨运行哈希缓存（每次都重新读取文件，最准确但更慢）\n\n"
         << "  SyncTool restore <文件夹> [--time <时间戳>] [--dry-run]\n"
         << "  SyncTool list <文件夹>\n"
+        << "  SyncTool clean <文件夹> [--time <时间戳>|--all] [--dry-run] [--yes]\n"
         << "  SyncTool help | --version\n\n"
         << "备份结构：\n"
         << "  <文件夹>/.backup/<时间>/<相对路径>       旧文件\n"
         << "  <文件夹>/.backup/<时间>/<相对路径>.zip   旧目录（快速压缩）\n"
-        << "  <文件夹>/.backup/<时间>/manifest.txt     记录哪些 zip 是目录备份\n\n"
+        << "  <文件夹>/.backup/<时间>/manifest.txt     记录哪些 zip 是目录备份\n"
+        << "  <文件夹>/.backup/<时间>/journal.jsonl    本次运行的变更日志（中断时保留，用于回滚）\n\n"
         << "说明：同步前会完整扫描并生成操作计划，写入系统临时目录并用独占句柄占用；\n"
+        << "      修改时间相同的单元会比对内容哈希，不同则逐个询问使用哪个为源（其他线程继续复制）；\n"
+        << "      中断（Ctrl+C）时可选择保留备份以便下次继续，或回滚本次已完成的更改；\n"
+        << "      时间点选择统一使用序号（1 开始）；Windows 长路径未开启时会询问并自动开启。\n"
         << "      同步期间会占用各根文件夹，请勿手动修改被同步目录。\n";
 }
 
@@ -1696,7 +2824,18 @@ static void printUsage()
 int main(int argc, char** argv)
 {
     setupConsole();
+    for (int i = 0; i < argc; ++i) g_originalArgs.push_back(argv[i]);
     installSignalHandlers();
+
+#if defined(_WIN32)
+    if (argc > 1 && std::strcmp(argv[1], "--enable-long-paths") == 0)
+    {
+        bool ok = isElevated() && setLongPathsEnabled();
+        std::cout << (ok ? "[长路径] 已开启 LongPathsEnabled=1\n" : "[长路径] 开启失败（需要管理员权限）\n");
+        return ok ? 0 : 1;
+    }
+#endif
+
     vector<string> args;
     for (int i = 2; i < argc; ++i) args.push_back(argv[i]);
     string cmd = argc > 1 ? argv[1] : "";
@@ -1706,6 +2845,7 @@ int main(int argc, char** argv)
     if (cmd == "sync") return runSync(args);
     if (cmd == "restore") return runRestore(args);
     if (cmd == "list") return runList(args);
+    if (cmd == "clean") return runClean(args);
 
     std::cout << "[错误] 未知命令: " << cmd << "\n";
     printUsage();
